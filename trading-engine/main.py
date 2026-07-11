@@ -3,6 +3,8 @@ import random
 import subprocess
 from pathlib import Path
 
+from database import init_db, save_trade
+
 DIR = Path(__file__).parent
 PRICING = DIR / "pricing"
 
@@ -34,8 +36,10 @@ def get_quote(price):
 
 def main():
     compile_pricing()
+    init_db()
     price = gen_prices(1)[0]
     bid, ask, option = get_quote(price)
+    save_trade("BUY", 1, ask)
     print(f"Market Price: ${price:.2f}")
     print(f"Bid: ${bid:.2f} | Ask: ${ask:.2f}")
     print(f"Option Value: ${option:.2f} (simplified)")
