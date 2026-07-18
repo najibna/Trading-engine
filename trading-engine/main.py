@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
+import queue
 import random
 import subprocess
+import threading
 from pathlib import Path
 
-from database import init_db, save_trade
+from database import init_db
 
 DIR = Path(__file__).parent
 PRICING = DIR / "pricing"
@@ -34,15 +36,29 @@ def get_quote(price):
     return bid, ask, option
 
 
+def feed_prices(q, prices):
+    for p in prices:
+        q.put(p)
+    q.put(None)
+
+
 def main():
     compile_pricing()
     init_db()
-    price = gen_prices(1)[0]
-    bid, ask, option = get_quote(price)
-    save_trade("BUY", 1, ask)
-    print(f"Market Price: ${price:.2f}")
-    print(f"Bid: ${bid:.2f} | Ask: ${ask:.2f}")
-    print(f"Option Value: ${option:.2f} (simplified)")
+    prices = gen_prices()
+    q = queue.Queue()
+    threading.Thread(target=feed_prices, args=(q, prices), daemon=True).start()
+    tick = 0
+    while True:
+        price = q.get()
+        if price is None:
+            break
+        bid, ask, option = get_quote(price)
+        if tick == 0:
+            print(f"Market Price: ${price:.2f}")
+            print(f"Bid: ${bid:.2f} | Ask: ${ask:.2f}")
+            print(f"Option Value: ${option:.2f} (simplified)")
+        tick += 1
 
 
 if __name__ == "__main__":
