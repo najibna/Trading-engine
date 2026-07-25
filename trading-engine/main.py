@@ -5,10 +5,15 @@ import subprocess
 import threading
 from pathlib import Path
 
-from database import init_db
+from database import init_db, save_trade
 
 DIR = Path(__file__).parent
 PRICING = DIR / "pricing"
+MAX_POS = 10
+
+position = 0
+avg_cost = 0.0
+realized_pnl = 0.0
 
 
 def compile_pricing():
@@ -36,6 +41,22 @@ def get_quote(price):
     return bid, ask, option
 
 
+def try_order(side, qty, fill):
+    global position, avg_cost, realized_pnl
+    if side == "BUY" and position + qty > MAX_POS:
+        return "REJECTED"
+    if side == "SELL" and position < qty:
+        return "REJECTED"
+    if side == "BUY":
+        avg_cost = (avg_cost * position + fill * qty) / (position + qty)
+        position += qty
+    else:
+        realized_pnl += (fill - avg_cost) * qty
+        position -= qty
+    save_trade(side, qty, fill)
+    return "APPROVED"
+
+
 def feed_prices(q, prices):
     for p in prices:
         q.put(p)
@@ -57,7 +78,15 @@ def main():
         if tick == 0:
             print(f"Market Price: ${price:.2f}")
             print(f"Bid: ${bid:.2f} | Ask: ${ask:.2f}")
-            print(f"Option Value: ${option:.2f} (simplified)")
+            print(f"Option Value: ${option:.2f} (simplified)\n")
+            status = try_order("BUY", 1, ask)
+            print(f"Order: BUY 1 @ ${ask:.2f}")
+            print(f"Risk Check: {status}")
+            print(f"Position: {position} share(s)\n")
+        if tick == 5:
+            try_order("SELL", 1, bid)
+            print(f"Order: SELL 1 @ ${bid:.2f}")
+            print(f"Position: {position} shares")
         tick += 1
 
 
