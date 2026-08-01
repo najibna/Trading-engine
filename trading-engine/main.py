@@ -4,8 +4,10 @@ import random
 import subprocess
 import threading
 from pathlib import Path
+from time import perf_counter_ns
 
-from database import init_db, save_trade
+from backtest import backtest_pnl
+from database import count_trades, init_db, save_trade
 
 DIR = Path(__file__).parent
 PRICING = DIR / "pricing"
@@ -14,6 +16,7 @@ MAX_POS = 10
 position = 0
 avg_cost = 0.0
 realized_pnl = 0.0
+latencies = []
 
 
 def compile_pricing():
@@ -64,17 +67,25 @@ def feed_prices(q, prices):
 
 
 def main():
+    global latencies
     compile_pricing()
     init_db()
     prices = gen_prices()
+
     q = queue.Queue()
     threading.Thread(target=feed_prices, args=(q, prices), daemon=True).start()
+
     tick = 0
+
     while True:
         price = q.get()
         if price is None:
             break
+
+        t0 = perf_counter_ns()
         bid, ask, option = get_quote(price)
+        latencies.append(perf_counter_ns() - t0)
+
         if tick == 0:
             print(f"Market Price: ${price:.2f}")
             print(f"Bid: ${bid:.2f} | Ask: ${ask:.2f}")
@@ -83,11 +94,19 @@ def main():
             print(f"Order: BUY 1 @ ${ask:.2f}")
             print(f"Risk Check: {status}")
             print(f"Position: {position} share(s)\n")
+
         if tick == 5:
-            try_order("SELL", 1, bid)
+            status = try_order("SELL", 1, bid)
             print(f"Order: SELL 1 @ ${bid:.2f}")
             print(f"Position: {position} shares")
+            print(f"Realized P&L: {realized_pnl:+.2f}\n")
+
         tick += 1
+
+    avg_ms = sum(latencies) / len(latencies) / 1e6
+    print(f"Backtest P&L: {backtest_pnl(prices):+.2f}")
+    print(f"Average Processing Latency: {avg_ms:.2f} ms")
+    print(f"Trades Saved to SQLite: {count_trades()}")
 
 
 if __name__ == "__main__":
