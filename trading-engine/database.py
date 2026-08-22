@@ -6,9 +6,8 @@ DB = Path(__file__).parent / "trades.db"
 
 def init_db():
     with sqlite3.connect(DB) as c:
-        c.execute(
-            "CREATE TABLE IF NOT EXISTS trades (side TEXT, qty INT, price REAL)"
-        )
+        c.execute("DROP TABLE IF EXISTS trades")
+        c.execute("CREATE TABLE trades (side TEXT, qty INT, price REAL)")
         c.commit()
 
 
