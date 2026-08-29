@@ -1,3 +1,7 @@
 # Trading Engine Prototype
 
-Educational demo: simulated market data, pricing, risk, and storage.
+Simulated prices → C++ quotes → risk → SQLite → backtest.
+
+```bash
+cd trading-engine && python3 main.py
+```
