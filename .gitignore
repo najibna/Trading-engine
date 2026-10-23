@@ -1,5 +1,5 @@
-trading-engine/pricing
-trading-engine/trades.db
+pricing
+trades.db
 __pycache__/
 *.pyc
 .DS_Store

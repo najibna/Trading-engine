@@ -9,7 +9,6 @@ Small **educational demo** of a market-making pipeline: simulated prices → C++
 ## Quick start
 
 ```bash
-cd trading-engine
 python3 main.py                 # full local simulation
 python3 distributed_demo.py     # market-node + engine-node over TCP
 ```
@@ -191,7 +190,6 @@ Numbers change with the random seed and subprocess timing; shape of the output s
 ## Files
 
 ```
-trading-engine/
 ├── main.py              # Local pipeline + threading + latency
 ├── pricing.cpp          # C++ bid/ask/option
 ├── database.py          # SQLite
