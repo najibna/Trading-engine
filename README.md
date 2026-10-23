@@ -1,372 +1,561 @@
 # 📈 Trading Engine
 
-This project is a **small trading pipeline** you can run on your laptop. It shows how software might handle a stock price from start to finish:
+A small **Python + C++** program that simulates how trading software handles price updates: quote them, check rules, record trades, replay history, and measure speed. Optional second script splits **market data** and **pricing** into two processes on TCP.
 
-1. 📊 Get a price update  
-2. ⚡ Turn it into a **bid** and **ask** (C++)  
-3. 🛡️ Check you are allowed to trade  
-4. 📝 Place a **simulated** buy or sell  
-5. 💾 Save the trade to a database  
-6. 📉 Replay prices to estimate profit/loss  
-7. ⏱️ Measure how fast pricing runs  
-
-🔒 **Important:** Nothing connects to a real broker or live market. All prices and trades are generated in code so you can learn the flow safely.
+🔒 No real broker. No live market. All prices and trades are generated in code.
 
 ---
 
-## 🤔 Words you will see
+## 📑 Table of contents
 
-| Word | Simple meaning |
+1. [🤔 Glossary](#-glossary)
+2. [🗺️ Repo map](#️-repo-map)
+3. [🐍 `main.py` (every line explained)](#-mainpy-every-line-explained)
+4. [⚡ `pricing.cpp` (every line explained)](#-pricingcpp-every-line-explained)
+5. [💾 `database.py` (every part explained)](#-databasepy-every-part-explained)
+6. [📉 `backtest.py` (every part explained)](#-backtestpy-every-part-explained)
+7. [🌐 `distributed_demo.py` (every part explained)](#-distributed_demopy-every-part-explained)
+8. [🙈 `.gitignore`](#-gitignore)
+9. [▶️ How to run](#️-how-to-run)
+10. [📺 Output (every printed line)](#-output-every-printed-line)
+11. [❓ FAQ](#-faq)
+
+---
+
+## 🤔 Glossary
+
+| Word | Meaning in this repo |
+|------|----------------------|
+| **Tick** | One price update (one loop in `main.py`). |
+| **Spot / market price** | The fake current stock price for that tick. |
+| **Bid** | Best buy price from the market side; you **sell** here. |
+| **Ask** | Best sell price from the market side; you **buy** here. |
+| **Spread** | `ask - bid` (here always **$0.10**). |
+| **Position** | Shares you hold (`position` variable). |
+| **Fill price** | Price used for the simulated trade (`ask` for BUY, `bid` for SELL). |
+| **Realized P/L** | Profit/loss locked in when you sell (`realized_pnl`). |
+| **Backtest P/L** | Separate P/L from replaying all prices in `backtest.py`. |
+| **Latency** | Nanoseconds spent inside `get_quote()` per tick, shown as ms average. |
+| **Queue** | Thread-safe FIFO buffer between feed thread and main thread. |
+| **Daemon thread** | Background thread that exits when the main program exits. |
+| **Subprocess** | Separate OS process (used to run `./pricing`). |
+| **SQLite** | File database `trades.db` with a simple `trades` table. |
+| **TCP** | Network protocol; used on `127.0.0.1:5555` only (your machine). |
+| **JSON line** | One JSON object per line, e.g. `{"price": 100.14}`. |
+
+---
+
+## 🗺️ Repo map
+
+```
+Trading-engine/          ← GitHub repo root
+├── main.py              ← Main simulation
+├── pricing.cpp          ← C++ source for quotes
+├── database.py          ← SQLite helpers
+├── backtest.py          ← P/L replay function
+├── distributed_demo.py  ← Two-process TCP version
+├── .gitignore           ← Ignores build + DB artifacts
+├── README.md            ← This file
+├── pricing              ← Built by C++ (not in git)
+└── trades.db            ← Created at run time (not in git)
+```
+
+**Runtime flow (local):**
+
+```
+gen_prices → queue → get_quote(pricing) → try_order → save_trade → trades.db
+                              ↓
+                         latencies[]
+                              ↓
+                    backtest_pnl(prices) + print stats
+```
+
+---
+
+## 🐍 `main.py` (every line explained)
+
+### 📦 Imports (lines 1–10)
+
+| Import | Why it is here |
+|--------|----------------|
+| `queue` | `queue.Queue()` holds prices between threads. |
+| `random` | Random walk for fake prices in `gen_prices()`. |
+| `subprocess` | Runs `./pricing` and compiles C++ in `compile_pricing()`. |
+| `threading` | Starts `feed_prices` on a second thread. |
+| `Path` | Finds folder paths for `pricing.cpp` and binary. |
+| `perf_counter_ns` | High-resolution timer around C++ calls. |
+| `backtest_pnl` | Called once at end for summary P/L. |
+| `count_trades`, `init_db`, `save_trade` | SQLite setup and writes. |
+
+`#!/usr/bin/env python3` lets you run `./main.py` on Unix if the file is executable.
+
+---
+
+### 🔢 Module constants (lines 12–14)
+
+| Name | Value | Meaning |
+|------|-------|---------|
+| `DIR` | Folder containing `main.py` | Base path for C++ files. |
+| `PRICING` | `DIR / "pricing"` | Path to compiled C++ executable. |
+| `MAX_POS` | `10` | Max shares you can hold (risk limit). |
+
+---
+
+### 🌐 Module globals (lines 16–19)
+
+| Name | Start value | Updated when | Meaning |
+|------|-------------|--------------|---------|
+| `position` | `0` | `try_order()` | Shares owned now. |
+| `avg_cost` | `0.0` | On each **BUY** | Average price paid for current shares. |
+| `realized_pnl` | `0.0` | On each **SELL** | Running closed P/L. |
+| `latencies` | `[]` | Each tick in `main()` | List of nanoseconds for each `get_quote()`. |
+
+These are **module-level globals** (simple style for a small script).
+
+---
+
+### `compile_pricing()` (lines 22–26)
+
+| Step | What happens |
 |------|----------------|
-| **Stock price** | What one share might cost right now (here: fake numbers near $100). |
-| **Bid** | Price a buyer offers. You **sell** into the bid. |
-| **Ask** | Price a seller wants. You **buy** at the ask. |
-| **Spread** | Gap between bid and ask (here: $0.10 total, $0.05 each side). |
-| **Position** | How many shares you hold (starts at 0). |
-| **Order** | A request to buy or sell (simulated, not sent anywhere). |
-| **Risk check** | Rules that block bad trades (too many shares, sell when empty). |
-| **SQLite** | A tiny database stored in one file: `trades.db`. |
-| **Backtest** | Run old prices through simple rules to see what P/L might have been. |
-| **Latency** | How long one step took (here: calling the C++ pricer). |
-| **Thread** | Two tasks running at the same time inside one program. |
-| **TCP** | Network pipe so two programs can send prices to each other. |
+| 1 | If `./pricing` already exists, do nothing. |
+| 2 | Else run shell command: `c++ -O2 pricing.cpp -o pricing`. |
+| `-O2` | Compiler optimization (faster binary). |
+| `check=True` | Crash with error if compile fails. |
 
 ---
 
-## 🧩 Big picture
+### `gen_prices(n=100)` (lines 29–36)
+
+| Step | What happens |
+|------|----------------|
+| `random.seed(42)` | Same random sequence every run (repeatable prices). |
+| `p = 100.0` | Start near $100. |
+| Loop `n` times | `p += random.uniform(-0.5, 0.5)` then `round(p, 2)`. |
+| Return | List of `n` floats, e.g. 100 prices. |
+
+So each price is a **random walk** with steps between -$0.50 and +$0.50.
+
+---
+
+### `get_quote(price)` (lines 39–44)
+
+| Step | What happens |
+|------|----------------|
+| 1 | Run `[PRICING, str(price)]` as subprocess. |
+| 2 | `capture_output=True` grabs stdout. |
+| 3 | `text=True` decodes stdout as string. |
+| 4 | `check=True` raises if C++ exits with error. |
+| 5 | Split stdout on spaces → 3 floats: **bid, ask, option**. |
+| 6 | Return tuple `(bid, ask, option)`. |
+
+**Note:** `option` is computed in C++ but only **printed** on tick 0 in `main()`; it is not used for trading logic.
+
+---
+
+### `try_order(side, qty, fill)` (lines 47–60)
+
+**Parameters:**
+
+| Param | Type | Meaning |
+|-------|------|---------|
+| `side` | `"BUY"` or `"SELL"` | Direction. |
+| `qty` | int | Shares (always `1` in sample orders). |
+| `fill` | float | Execution price (ask or bid). |
+
+**Logic order:**
 
 ```
-  📊 prices  →  ⚡ C++ quotes  →  🛡️ risk  →  📝 orders  →  💾 SQLite
-       |                                              |
-       └──────────── 📉 backtest + ⏱️ speed ──────────┘
+1. If BUY and position + qty > MAX_POS → return "REJECTED" (no DB write)
+2. If SELL and position < qty           → return "REJECTED"
+3. If BUY:
+     avg_cost = (avg_cost * position + fill * qty) / (position + qty)
+     position += qty
+4. If SELL:
+     realized_pnl += (fill - avg_cost) * qty
+     position -= qty
+5. save_trade(side, qty, fill)
+6. return "APPROVED"
 ```
 
-### What each step does (full picture)
-
-| Step | What happens | Where in code |
-|------|----------------|---------------|
-| 📊 **Prices** | Python builds a list of **100** prices. Each price is the last price plus a small random move. They stay roughly near **$100**. Same random seed every run so results repeat. | `gen_prices()` in `main.py` |
-| ⚡ **Quotes** | For each price, Python runs the **C++ program** `./pricing`. It returns three numbers: bid, ask, and a placeholder option value. | `get_quote()` calls `pricing.cpp` |
-| 🛡️ **Risk** | Before a buy: new position must be **≤ 10 shares**. Before a sell: you must own enough shares. | `try_order()` in `main.py` |
-| 📝 **Orders** | Buys fill at **ask**. Sells fill at **bid**. The script logs two sample trades (first tick buy, sixth tick sell). | `try_order()` + main loop |
-| 💾 **Save** | Each approved trade is one row in SQLite. | `database.py` |
-| 📉 **Backtest** | Uses the **same 100 prices** with simple rules: buy when price ≤ 99.5, sell when ≥ 100.5. Computes cash + leftover shares marked to last price. | `backtest.py` |
-| ⏱️ **Speed** | Times only the C++ call with `perf_counter_ns()`, then prints average milliseconds per tick. | main loop |
+**Important:** Rejected orders do **not** call `save_trade()`.
 
 ---
 
-## 🛠️ What you need
+### `feed_prices(q, prices)` (lines 63–66)
 
-| Need | Why |
-|------|-----|
-| 🐍 **Python 3** | Runs the main logic, threads, database, backtest. |
-| ⚙️ **C++ compiler** (`c++` on PATH) | Builds `pricing.cpp` into `./pricing` the first time. |
-| 💻 **macOS or Linux** | Uses standard Python libraries (threads, SQLite, sockets). |
+| Step | What happens |
+|------|----------------|
+| For each `p` in `prices` | `q.put(p)` |
+| After all prices | `q.put(None)` = **stop signal** for main loop |
+
+Runs on **Thread 1** (daemon).
 
 ---
 
-## ▶️ Run
+### `main()` (lines 69–109)
 
-From the repo root:
+| Line block | What happens |
+|------------|----------------|
+| `compile_pricing()` | Ensure `./pricing` exists. |
+| `init_db()` | Reset/create SQLite table (see `database.py`). |
+| `prices = gen_prices()` | 100 prices, seed 42. |
+| `q = queue.Queue()` | Shared queue. |
+| `threading.Thread(..., daemon=True).start()` | Start feed thread. |
+| `tick = 0` | Counter for which price we are on (0-based). |
+
+**Main loop:**
+
+| Step | Code | Meaning |
+|------|------|---------|
+| Wait for price | `price = q.get()` | Blocks until feed sends a price. |
+| Stop | `if price is None: break` | Feed finished. |
+| Time C++ | `t0 = perf_counter_ns()` | Start timer. |
+| Quote | `bid, ask, option = get_quote(price)` | Call C++. |
+| Save timing | `latencies.append(...)` | Store duration in ns. |
+
+**Tick 0 only:**
+
+| Action | Detail |
+|--------|--------|
+| Print | Market price, bid, ask, option. |
+| Order | `try_order("BUY", 1, ask)` |
+| Print | Order line, risk status, position. |
+
+**Tick 5 only:**
+
+| Action | Detail |
+|--------|--------|
+| Order | `try_order("SELL", 1, bid)` |
+| Print | SELL line, position, `realized_pnl` (status returned but not printed here). |
+
+**After loop:**
+
+| Line | Formula / meaning |
+|------|-------------------|
+| `avg_ms = sum(latencies) / len(latencies) / 1e6` | Mean ns → milliseconds (`1e6` ns per ms). |
+| `backtest_pnl(prices)` | Separate strategy P/L on full list. |
+| `count_trades()` | Rows in DB from approved sample orders. |
+
+---
+
+### `if __name__ == "__main__"` (lines 112–113)
+
+Runs `main()` only when you execute `python3 main.py`, not when another file imports `main.py` (e.g. `distributed_demo.py` imports helpers without running the simulation).
+
+---
+
+## ⚡ `pricing.cpp` (every line explained)
+
+| Line | Code | Meaning |
+|------|------|---------|
+| 1–2 | `#include <iomanip>`, `<iostream>` | Formatting and console I/O. |
+| 4 | `int main(int argc, char* argv[])` | Standard C++ entry; args from command line. |
+| 5 | `if (argc < 2) return 1` | Need spot price argument or exit with code 1. |
+| 6 | `std::stod(argv[1])` | Parse first arg as double. |
+| 7 | `bid = price - 0.05` | Bid side of book. |
+| 8 | `ask = price + 0.05` | Ask side of book. |
+| 9 | `option = price * 0.025` | Placeholder option value (2.5% of spot). |
+| 10 | `cout` with `fixed`, `setprecision(2)` | Print 3 numbers, 2 decimals, space-separated + newline. |
+| 11 | `return 0` | Success. |
+
+**Contract with Python:** stdout must be exactly:  
+`"<bid> <ask> <option>\n"`  
+Example: `./pricing 100.14` → `100.09 100.19 2.50`
+
+---
+
+## 💾 `database.py` (every part explained)
+
+### `DB` (line 4–5)
+
+Path to **`trades.db`** in the same folder as `database.py`.
+
+### `init_db()` (lines 7–11)
+
+| SQL / step | Purpose |
+|------------|---------|
+| `DROP TABLE IF EXISTS trades` | Wipe old runs so each simulation starts clean. |
+| `CREATE TABLE trades (side TEXT, qty INT, price REAL)` | Three columns only. |
+| `commit()` | Save changes to disk. |
+
+Uses `with sqlite3.connect(DB)` so the connection closes automatically.
+
+### `save_trade(side, qty, price)` (lines 14–17)
+
+| Part | Meaning |
+|------|---------|
+| `INSERT INTO trades VALUES (?, ?, ?)` | Parameterized insert (safe from SQL injection). |
+| Tuple `(side, qty, price)` | One row per approved order in `try_order()`. |
+
+### `count_trades()` (lines 20–22)
+
+| Part | Meaning |
+|------|---------|
+| `SELECT COUNT(*) FROM trades` | Total rows. |
+| `[0]` on `fetchone()` | Extract integer count for print at end of `main.py`. |
+
+**Table shape after sample run:**
+
+| side | qty | price |
+|------|-----|-------|
+| BUY | 1 | (ask at tick 0) |
+| SELL | 1 | (bid at tick 5) |
+
+---
+
+## 📉 `backtest.py` (every part explained)
+
+### `backtest_pnl(prices)` 
+
+**Docstring:** Buy when price ≤ 99.5 (pay ask), sell when ≥ 100.5 (get bid), mark open shares to last price.
+
+| Variable | Role |
+|----------|------|
+| `pos` | Share count in backtest (separate from `main.position`). |
+| `cash` | Dollars after simulated buys/sells. |
+
+**Loop for each `p` in `prices`:**
+
+| Condition | Action |
+|-----------|--------|
+| `p <= 99.5` and `pos < 10` | Buy 1: `cash -= p + 0.05`, `pos += 1` |
+| `p >= 100.5` and `pos > 0` | Sell 1: `cash += p - 0.05`, `pos -= 1` |
+| Else | No trade this step |
+
+**Return value:**
+
+```
+cash + pos * prices[-1]
+```
+
+= cash on hand + value of remaining shares at **last** price in the list.
+
+**Does not** write to SQLite. **Does not** use `try_order()`. Can trade many times across 100 ticks if rules keep firing.
+
+---
+
+## 🌐 `distributed_demo.py` (every part explained)
+
+### 📦 Imports
+
+| Import | Use |
+|--------|-----|
+| `json` | Encode/decode price messages. |
+| `socket` | TCP server and client. |
+| `subprocess` | Spawn second Python process in `run_demo()`. |
+| `sys` | `sys.executable`, `sys.argv` for roles. |
+| `time` | Sleep between connect retries. |
+| From `main` | Reuse `compile_pricing`, `gen_prices`, `get_quote`. |
+
+### Constants
+
+| Name | Value | Meaning |
+|------|-------|---------|
+| `HOST` | `127.0.0.1` | Localhost only. |
+| `PORT` | `5555` | TCP port for price stream. |
+| `TICKS` | `10` | Shorter stream than `main.py` (10 prices). |
+
+---
+
+### `market_node()` (lines 17–32)
+
+| Step | What happens |
+|------|----------------|
+| `gen_prices(TICKS)` | Same generator as main, but only 10 prices. |
+| `socket.AF_INET` | IPv4. |
+| `SOCK_STREAM` | TCP (reliable, ordered bytes). |
+| `SO_REUSEADDR` | Allows quick restart if port was recently used. |
+| `bind` + `listen(1)` | Wait for one client. |
+| `accept()` | Block until engine connects. |
+| For each price | `json.dumps({"price": price}) + "\n"`, UTF-8 encode, `sendall`. |
+| End | Send `{"done": true}\n` so client knows to stop. |
+
+Prints log lines with `[market-node]` prefix.
+
+---
+
+### `engine_node()` (lines 35–71)
+
+**Connect retry (lines 37–48):**
+
+| Detail | Why |
+|--------|-----|
+| Up to 50 tries | Market process may start slightly later. |
+| New socket each try | Avoid broken socket after refused connect. |
+| `sleep(0.05)` | 50 ms between tries. |
+| Failure | Raises `ConnectionRefusedError` with message. |
+
+**Read loop (lines 52–71):**
+
+| Part | Meaning |
+|------|---------|
+| `buf = ""` | Buffer for incomplete TCP chunks. |
+| `recv(4096)` | Read up to 4 KB (may be partial line). |
+| Split on `\n` | One JSON object per line (line protocol). |
+| Skip empty lines | After strip. |
+| `payload.get("done")` | Exit cleanly. |
+| `float(payload["price"])` | Spot for this tick. |
+| `get_quote(price)` | Same C++ path as `main.py`. |
+| Print | Price, bid, ask (option discarded with `_`). |
+
+---
+
+### `run_demo()` (lines 74–83)
+
+| Step | What happens |
+|------|----------------|
+| `Popen([sys.executable, __file__, "market"])` | Start **second Python process** as market server. |
+| `engine_node()` | Current process acts as client/pricer. |
+| `market.wait(timeout=10)` | Wait for server process to finish. |
+| Non-zero exit | Propagate failure via `SystemExit`. |
+
+---
+
+### `if __name__ == "__main__"` (lines 86–93)
+
+| `sys.argv[1]` | Behavior |
+|---------------|----------|
+| *(missing)* | `run_demo()` (both processes). |
+| `"market"` | Only `market_node()`. |
+| `"engine"` | Only `engine_node()`. |
+| anything else | Same as missing → `run_demo()`. |
+
+---
+
+## 🙈 `.gitignore`
+
+| Pattern | Ignores |
+|---------|---------|
+| `pricing` | Compiled C++ binary (machine-specific). |
+| `trades.db` | Local SQLite data. |
+| `__pycache__/` | Python bytecode cache folders. |
+| `*.pyc` | Compiled Python files. |
+| `.DS_Store` | macOS folder metadata. |
+
+---
+
+## ▶️ How to run
 
 ```bash
+# Local pipeline (100 ticks, DB, backtest, latency)
 python3 main.py
-```
 
-Optional second script (two programs talking over the network on your machine):
-
-```bash
+# Two processes over TCP (10 ticks, quotes only)
 python3 distributed_demo.py
-```
 
-First run of `main.py` compiles C++ if `./pricing` is missing:
+# Manual split:
+python3 distributed_demo.py market   # terminal 1
+python3 distributed_demo.py engine   # terminal 2
 
-```bash
+# Manual C++ build:
 c++ -O2 pricing.cpp -o pricing
-```
-
----
-
-## 🔄 Full walkthrough: `main.py`
-
-### 1️⃣ Startup
-
-```
-compile pricing binary (if needed)
-  ↓
-init_db()  →  fresh trades table in trades.db
-  ↓
-gen_prices(100)  →  list of 100 prices
-  ↓
-start feed thread  +  main loop consumes queue
-```
-
-### 2️⃣ Two threads (why two?)
-
-Real systems often **receive** data in one place and **process** it in another. Here we mimic that with a **queue**:
-
-```
-  🧵 Thread 1 (feed_prices)          🧵 Thread 2 (main)
-  ─────────────────────────          ───────────────────
-  for each price:                    while True:
-    q.put(price)                       price = q.get()
-  q.put(None)  ← stop signal           if None: break
-                                       bid, ask = C++ ...
-                                       maybe try_order(...)
-```
-
-The feed thread pushes all prices quickly. The main thread pulls them one by one, calls C++, and maybe trades. That is **multithreading**: two flows in one process.
-
-```mermaid
-flowchart TD
-  A[🏁 Start] --> B[📊 100 prices]
-  B --> C[🧵 Feed thread → queue]
-  C --> D[📥 Main reads price]
-  D --> E[⏱️ Start timer]
-  E --> F[⚡ C++ bid / ask / option]
-  F --> G[⏱️ Stop timer, save ms]
-  G --> H{Tick 0 or 5?}
-  H -->|yes| I[📝 try_order]
-  H -->|no| J[Skip order]
-  I --> K{🛡️ OK?}
-  K -->|yes| L[💾 save_trade]
-  K -->|no| M[REJECTED]
-  L --> N{More prices?}
-  M --> N
-  J --> N
-  N -->|yes| D
-  N -->|no| O[📉 backtest_pnl + print stats]
-```
-
-### 3️⃣ Sample orders (what you see in the terminal)
-
-| Tick | Action | Price used | Why |
-|------|--------|------------|-----|
-| **0** | BUY 1 share | **Ask** (you pay the seller’s price) | Shows risk **APPROVED** and position **1** |
-| **5** | SELL 1 share | **Bid** (you receive the buyer’s price) | Shows position back to **0** and **realized P/L** |
-
-Other ticks still run pricing and timing; they just do not print orders unless you change the code.
-
-### 4️⃣ Risk rules (exact behavior)
-
-```
-BUY qty shares:
-  if position + qty > 10  →  REJECTED
-  else                    →  APPROVED, position increases, save to DB
-
-SELL qty shares:
-  if position < qty       →  REJECTED
-  else                    →  APPROVED, position decreases, update realized P/L
-```
-
-**Realized P/L** on sell = `(sell price - average cost of shares) × quantity`.  
-**Average cost** updates on each buy (weighted average).
-
-### 5️⃣ End of run
-
-After all 100 ticks:
-
-- Prints **Backtest P/L** from `backtest_pnl(prices)` (separate logic from live sample orders)  
-- Prints **Average Processing Latency** (mean time of C++ calls only)  
-- Prints **Trades Saved to SQLite** (count of rows from sample orders)
-
----
-
-## ⚡ Full walkthrough: `pricing.cpp`
-
-Input: one number on the command line (spot price).
-
-Output: three numbers on one line: `bid ask option`
-
-| Output | Formula in this project |
-|--------|-------------------------|
-| **bid** | `price - 0.05` |
-| **ask** | `price + 0.05` |
-| **option** | `price × 0.025` (placeholder only, not Black-Scholes) |
-
-Example:
-
-```bash
 ./pricing 100.00
-# prints: 99.95 100.05 2.50
-```
 
-Python calls it like:
-
-```text
-subprocess: ./pricing 100.14  →  parse stdout → floats
-```
-
-Why C++ in a Python project? Many teams put **hot path** math in C++ for speed; Python stays the glue for I/O, risk, and storage. Here the math is tiny, but the **pattern** is real.
-
----
-
-## 💵 Bid and ask (visual)
-
-If the market price is **$100.00**:
-
-```
-   SELL ◀──  $99.95   $100.00   $100.05  ──▶ BUY
-              bid      market      ask
-```
-
-- **Market makers** often quote both sides.  
-- **Spread** is how they might earn on round trips (buy low at bid, sell high at ask). This code only **simulates** that idea.
-
----
-
-## 💾 Full walkthrough: `database.py`
-
-| Function | What it does |
-|----------|----------------|
-| `init_db()` | Drops old `trades` table if present, creates new table `(side, qty, price)` |
-| `save_trade(side, qty, price)` | Inserts one row |
-| `count_trades()` | Returns row count for the summary line |
-
-File location: **`trades.db`** next to the Python files.
-
-Example rows after a run:
-
-```text
-BUY  | 1 | 100.19
-SELL | 1 | 99.53
-```
-
-You can inspect with:
-
-```bash
+# Inspect DB after main.py:
 sqlite3 trades.db "SELECT * FROM trades;"
 ```
 
 ---
 
-## 📉 Full walkthrough: `backtest.py`
+## 📺 Output (every printed line)
 
-Replays the **same price list** with fixed rules (not the same as tick 0 / 5 orders):
+### `main.py`
 
-```
-for each price p:
-  if p <= 99.5 and position < 10:
-    buy 1 share, pay p + 0.05  (ask)
-  elif p >= 100.5 and position > 0:
-    sell 1 share, receive p - 0.05  (bid)
+| Output | Source |
+|--------|--------|
+| `Market Price: $...` | Tick 0 spot. |
+| `Bid: ... \| Ask: ...` | C++ quote on tick 0. |
+| `Option Value: ... (simplified)` | C++ placeholder option. |
+| `Order: BUY 1 @ $...` | Tick 0, fill at ask. |
+| `Risk Check: APPROVED` or would be `REJECTED` | Return value of `try_order`. |
+| `Position: N share(s)` | Global `position` after buy. |
+| `Order: SELL 1 @ $...` | Tick 5, fill at bid. |
+| `Position: N shares` | After sell. |
+| `Realized P&L: +X.XX` | Global `realized_pnl` after sell. |
+| `Backtest P/L: ...` | `backtest_pnl(prices)`. |
+| `Average Processing Latency: X.XX ms` | Mean of `latencies`. |
+| `Trades Saved to SQLite: N` | `count_trades()`. |
 
-final value = cash + (shares left × last price)
-```
+### `distributed_demo.py`
 
-So backtest answers: *“If I had used these simple rules on this fake history, what might my P/L be?”*  
-It runs **after** the live loop and does not change `trades.db` from the sample orders unless you extend the code.
-
----
-
-## 🌐 Full walkthrough: `distributed_demo.py`
-
-Same **price → C++ quote** idea, but split into **two processes** like two services on a network:
-
-```
-  📡 market-node (Process A)              🖥️ engine-node (Process B)
-  ─────────────────────────              ───────────────────────────
-  bind 127.0.0.1:5555                    connect to 127.0.0.1:5555
-  send lines: {"price": 100.14}\n        read JSON lines
-  send {"done": true} at end             call get_quote(price)
-                                         print bid / ask
-```
-
-**Why this exists:** In production, market data often comes from another machine or process. TCP + JSON lines is a minimal stand-in for that split.
-
-```bash
-python3 distributed_demo.py          # starts market process, then engine
-python3 distributed_demo.py market   # terminal 1: publisher only
-python3 distributed_demo.py engine   # terminal 2: consumer only
-```
-
-The engine retries connect a few times so the market process has time to start listening.
+| Prefix | Meaning |
+|--------|---------|
+| `[market-node] listening...` | Server ready. |
+| `[market-node] engine connected...` | Client IP/port. |
+| `[market-node] published price=...` | One JSON tick sent. |
+| `[market-node] stream finished` | Done + done sentinel sent. |
+| `[engine-node] connected...` | Client side up. |
+| `[engine-node] recv price=... -> bid=... ask=...` | Priced tick. |
+| `[engine-node] done` | Received `{"done": true}`. |
+| `=== Distributed simulation...` | Banner when running combined mode. |
 
 ---
 
-## 📁 Files and how they connect
-
-| File | Role |
-|------|------|
-| 🐍 **`main.py`** | Orchestrator: threads, queue, C++ calls, risk, sample orders, latency, backtest print |
-| ⚡ **`pricing.cpp`** | Bid, ask, placeholder option |
-| 💾 **`database.py`** | SQLite create / insert / count |
-| 📉 **`backtest.py`** | Offline P/L on price list |
-| 🌐 **`distributed_demo.py`** | TCP publisher + consumer using helpers from `main.py` |
+## 🧩 End-to-end picture
 
 ```
-                    ┌─────────────┐
-                    │   main.py   │
-                    └──────┬──────┘
-           ┌───────────────┼───────────────┐
-           ▼               ▼               ▼
-    ┌──────────┐    ┌────────────┐   ┌───────────┐
-    │ pricing  │    │ database.py│   │ backtest  │
-    │  (C++)   │    │  trades.db │   │   .py     │
-    └──────────┘    └────────────┘   └───────────┘
+                    MAIN.PY
+                    ───────
+  gen_prices(100)
+        │
+        ▼
+  feed_prices ──queue──▶ for each price:
+        │                    get_quote → pricing.cpp
+        │                    latencies[]
+        │                    tick 0: BUY @ ask → DB
+        │                    tick 5: SELL @ bid → DB
+        ▼
+  backtest_pnl(prices)     count_trades()
+        │                        │
+        └──────── print summary ─┘
 
-    distributed_demo.py ──imports──▶ main.py (gen_prices, get_quote, compile)
+
+              DISTRIBUTED_DEMO.PY
+              ───────────────────
+  Process A: market_node          Process B: engine_node
+  gen_prices(10)                  connect + retry
+  TCP send JSON lines      ───▶   get_quote per price
+  {"done": true}                  print bid/ask
 ```
 
 ---
 
-## 📺 Sample output (line by line)
+## ❓ FAQ
 
-```text
-Market Price: $100.14          ← first tick from fake feed
-Bid: $100.09 | Ask: $100.19    ← C++ spread around that price
-Option Value: $2.50 (simplified)
+**Why are Backtest P/L and Realized P/L different?**  
+They use **different rules**. Realized is from 2 manual orders on ticks 0 and 5. Backtest loops all 100 prices with 99.5 / 100.5 thresholds.
 
-Order: BUY 1 @ $100.19         ← paid the ask
-Risk Check: APPROVED           ← under 10 share limit
-Position: 1 share(s)
+**Why `None` in the queue?**  
+So the main thread knows the feed thread is done (sentinel pattern).
 
-Order: SELL 1 @ $99.53         ← tick 5, hit the bid
-Position: 0 shares
-Realized P&L: -0.66            ← sell vs your average buy cost
+**Why daemon thread?**  
+If main exits, Python will not hang waiting for the feeder.
 
-Backtest P&L: -9.18            ← separate replay rules on all 100 prices
-Average Processing Latency: 7.45 ms   ← mean C++ call time
-Trades Saved to SQLite: 2      ← sample BUY + SELL rows
-```
+**Does distributed mode use the database?**  
+No. Only prints quotes unless you extend the code.
 
-Numbers vary slightly with machine load; the **order of lines** stays the same.
+**What if C++ is missing?**  
+`compile_pricing()` runs on startup; you need `c++` installed.
+
+**What if port 5555 is busy?**  
+Change `PORT` in `distributed_demo.py` or stop the other process using it.
 
 ---
 
-## 🗂️ Auto-created files
+## 🔧 Constants cheat sheet (all magic numbers)
 
-| File | What it is |
-|------|------------|
-| **`pricing`** | Compiled C++ executable (gitignored) |
-| **`trades.db`** | SQLite trade log (gitignored) |
-
-Delete them anytime. Running `main.py` rebuilds what it needs.
-
----
-
-## 🧪 Ideas to try next
-
-| Idea | What to change |
-|------|----------------|
-| 📊 More orders | Call `try_order()` on more ticks in `main.py` |
-| 🛡️ Stricter risk | Lower `MAX_POS` in `main.py` |
-| 📉 Different strategy | Edit thresholds in `backtest.py` |
-| ⚡ Faster path | Keep C++ loaded instead of subprocess (advanced) |
-| 🌐 Remote host | Change `HOST` in `distributed_demo.py` (same LAN only; be careful with security) |
-
----
-
-## ❓ Quick FAQ
-
-**Q: Is this real trading?**  
-A: No. No API keys, no exchange, no real money.
-
-**Q: Why subprocess for C++?**  
-A: Easiest split for a small repo. Production might use shared libraries or IPC.
-
-**Q: Why two different P/L numbers?**  
-A: **Realized P/L** is from the two sample trades. **Backtest P/L** is from a different rule set on all prices.
-
-**Q: Can I run without C++?**  
-A: You need a compiler once to build `pricing`, or build it manually and keep `./pricing` in the folder.
+| Value | Where | Meaning |
+|-------|-------|---------|
+| `42` | `gen_prices` | Random seed |
+| `100` | `gen_prices()` default | Price count in main |
+| `10` | `MAX_POS`, backtest | Max shares |
+| `0.05` | C++, backtest | Half spread / slippage |
+| `0.025` | C++ | Option placeholder ratio |
+| `0.5` | `gen_prices` | Max random step per tick |
+| `99.5` / `100.5` | `backtest.py` | Buy/s sell thresholds |
+| `5555` | distributed | TCP port |
+| `10` | `TICKS` | Prices in distributed mode |
+| `50` × `0.05s` | engine connect | Max ~2.5s wait for server |
+| `4096` | `recv` | Read buffer size |
+| tick `0`, `5` | `main` | Sample order ticks |
